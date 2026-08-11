@@ -1,0 +1,4 @@
+htray
+*.o
+.hedlog
+tags
