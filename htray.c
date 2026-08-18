@@ -8,15 +8,21 @@
  * running while hidden - only the bar window is unmapped. */
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
+#include <X11/extensions/Xrandr.h>
+#include <X11/Xft/Xft.h>
 
 #define STB_DS_IMPLEMENTATION
 #include <stb_ds.h>
@@ -24,45 +30,16 @@
 #define SYSTEM_TRAY_REQUEST_DOCK 0
 #define XEMBED_EMBEDDED_NOTIFY 0
 
-/* configuration */
-static const unsigned int barh     = 32;         /* bar height in px */
-static const unsigned int borderpx = 2;          /* border width */
-static const unsigned int padding  = 0;         /* gap from screen corner */
-static const unsigned int hpad     = 10;         /* inner horizontal padding */
-static const unsigned int iconsize = 22;         /* tray icon side in px */
-static const unsigned int spacing  = 8;          /* gap between icons/text */
-static const char col_bg[]         = "#1a1b26";
-static const char col_fg[]         = "#7aa2f7";
-static const char col_border[]     = "#3b4261";
-static const char fontname[]       = "10x20";    /* "fixed" as fallback */
-static const char timefmt[]        = "%d(%a) %H:%M"; /* strftime clock format */
-static const int starthidden       = 0;
-static const int atbottom          = 1;          /* anchor to bottom edge */
-static const unsigned int batw     = 18;         /* battery icon body width */
-static const unsigned int bath     = 10;         /* battery icon body height */
-static const unsigned int batnubw  = 2;          /* battery nub width */
-static const unsigned int batnubh  = 4;          /* battery nub height */
-static const unsigned int spkw     = 15;         /* speaker icon width */
-static const unsigned int spkh     = 10;         /* speaker icon height */
-static const unsigned int micw     = 9;          /* mic icon width */
-static const unsigned int mich     = 12;         /* mic icon height */
-static const unsigned int icgap    = 5;          /* gap between icon and text */
-static const unsigned int divh     = 16;         /* divider height */
-static const unsigned int memw     = 14;         /* mem chip body width */
-static const unsigned int memh     = 13;         /* mem chip height incl pins */
-static const unsigned int cpuw     = 13;         /* cpu chip width incl pins */
-static const unsigned int cpuh     = 13;         /* cpu chip height incl pins */
-/* reserved readout widths so the bar doesn't resize as values change */
-static const char cputmpl[]        = "00%";
-static const char memtmpl[]        = "00.0G";
-static const char voltmpl[]        = "00%";
-static const char mictmpl[]        = "00%";
+#include "config.h"
 
 static Display *dpy;
-static int screen, sw, sh;
+static int screen, haverandr;
+static int mx, my, mw, mh; /* monitor the bar sits on */
 static Window root, barwin, selwin;
 static GC gc;
-static XFontStruct *font;
+static XftFont *font;
+static XftDraw *xd;
+static XftColor xftfg, xftdim;
 static unsigned long bgpx, fgpx, borderpx_col;
 static Atom xembed, manager, trayatom, trayopcode, trayorient, netcurdesk;
 static Window *icons; /* stb_ds array, in docking order */
@@ -75,13 +52,81 @@ static int cpupct = -1;
 static long cpuprevtot, cpuprevidle;
 static int batcap = -1, volpct = -1, micpct = -1, volmute, micmute;
 static int desknum = -1;
-static volatile sig_atomic_t togglereq;
+static volatile sig_atomic_t togglereq, focusreq;
+static char inputbuf[256];       /* command being typed */
+static char cmdname[256];        /* the running command, notification title */
+static char cmdout[2048];        /* raw output of the running command */
+static size_t cmdoutlen;
+static int inputactive;          /* keyboard grabbed, keys go to the box */
+static pid_t cmdpid;
+static int cmdfd = -1;           /* read end of the running command's pipe */
 
 static void
 die(const char *msg)
 {
 	fputs(msg, stderr);
 	exit(1);
+}
+
+static void
+envuint(const char *name, unsigned int *dst)
+{
+	const char *s = getenv(name);
+	char *end;
+	long v;
+
+	if (!s || !*s)
+		return;
+	v = strtol(s, &end, 10);
+	if (!*end && v >= 0)
+		*dst = (unsigned int)v;
+}
+
+static void
+envint(const char *name, int *dst)
+{
+	const char *s = getenv(name);
+	char *end;
+	long v;
+
+	if (!s || !*s)
+		return;
+	v = strtol(s, &end, 10);
+	if (!*end)
+		*dst = (int)v;
+}
+
+static void
+envstr(const char *name, const char **dst)
+{
+	const char *s = getenv(name);
+
+	if (s && *s)
+		*dst = s;
+}
+
+/* apply HTRAY_* environment overrides to the config.h defaults */
+static void
+loadconfig(void)
+{
+	envuint("HTRAY_HEIGHT", &barh);
+	envuint("HTRAY_BORDERPX", &borderpx);
+	envuint("HTRAY_PADDING", &padding);
+	envuint("HTRAY_HPAD", &hpad);
+	envuint("HTRAY_ICONSIZE", &iconsize);
+	envuint("HTRAY_SPACING", &spacing);
+	envuint("HTRAY_FONTSIZE", &fontsize);
+	envuint("HTRAY_CMDTIMEOUT", &cmdtimeout);
+	envuint("HTRAY_INPUTW", &inputw);
+	envint("HTRAY_HIDDEN", &starthidden);
+	envint("HTRAY_BOTTOM", &atbottom);
+	envstr("HTRAY_BG", &col_bg);
+	envstr("HTRAY_FG", &col_fg);
+	envstr("HTRAY_BORDER", &col_border);
+	envstr("HTRAY_FONT", &fontname);
+	envstr("HTRAY_TIMEFMT", &timefmt);
+	if (barh < 8)
+		barh = 8;
 }
 
 /* tray icons come and go at will; ignore errors from vanished windows */
@@ -92,11 +137,14 @@ xerror(Display *d, XErrorEvent *ee)
 	return 0;
 }
 
+/* SIGUSR1 toggles the bar, SIGUSR2 toggles input-box focus */
 static void
-sigusr1(int sig)
+sighandler(int sig)
 {
-	(void)sig;
-	togglereq = 1;
+	if (sig == SIGUSR2)
+		focusreq = 1;
+	else
+		togglereq = 1;
 }
 
 static void
@@ -118,28 +166,94 @@ findbattery(void)
 	closedir(dir);
 }
 
+static long
+nowms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* run argv, capturing its stdout into buf; the child is killed once
+ * cmdtimeout ms pass, so a hung command (e.g. wpctl against a wedged
+ * pipewire) cannot block the bar. Returns bytes read, -1 if none. */
+static int
+readcmd(char *const argv[], char *buf, size_t size)
+{
+	fd_set fds;
+	struct timeval tv;
+	pid_t pid;
+	long deadline, left;
+	ssize_t n;
+	size_t len = 0;
+	int fd[2], devnull;
+
+	buf[0] = '\0';
+	if (pipe(fd) < 0)
+		return -1;
+	switch ((pid = fork())) {
+	case -1:
+		close(fd[0]);
+		close(fd[1]);
+		return -1;
+	case 0:
+		close(fd[0]);
+		dup2(fd[1], 1);
+		close(fd[1]);
+		if ((devnull = open("/dev/null", O_WRONLY)) >= 0)
+			dup2(devnull, 2);
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	close(fd[1]);
+	deadline = nowms() + (long)cmdtimeout;
+	while (len < size - 1) {
+		if ((left = deadline - nowms()) <= 0)
+			break;
+		FD_ZERO(&fds);
+		FD_SET(fd[0], &fds);
+		tv.tv_sec = left / 1000;
+		tv.tv_usec = (left % 1000) * 1000;
+		n = select(fd[0] + 1, &fds, NULL, NULL, &tv);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		n = read(fd[0], buf + len, size - 1 - len);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		len += (size_t)n;
+	}
+	close(fd[0]);
+	kill(pid, SIGKILL); /* no-op if it already exited */
+	while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+		;
+	buf[len] = '\0';
+	return len ? (int)len : -1;
+}
+
 /* parse "Volume: 0.90 [MUTED]" from wpctl; -1 if unavailable */
 static int
 getvolume(const char *target, int *muted)
 {
-	char cmd[64], line[64];
-	FILE *p;
+	char *argv[] = { "wpctl", "get-volume", (char *)target, NULL };
+	char line[64];
 	float v;
 	int pct = -1;
 
 	*muted = 0;
-	snprintf(cmd, sizeof cmd, "wpctl get-volume %s 2>/dev/null", target);
-	if (!(p = popen(cmd, "r")))
+	if (readcmd(argv, line, sizeof line) < 0)
 		return -1;
-	if (fgets(line, sizeof line, p)
-	    && sscanf(line, "Volume: %f", &v) == 1) {
+	if (sscanf(line, "Volume: %f", &v) == 1) {
 		pct = (int)(v * 100.0f + 0.5f);
 		if (pct > 999)
 			pct = 999;
 		if (strstr(line, "MUTED"))
 			*muted = 1;
 	}
-	pclose(p);
 	return pct;
 }
 
@@ -174,7 +288,7 @@ updatestatus(void)
 	char path[512], status[32], old[sizeof stattxt];
 	FILE *f;
 	int cap = -1;
-	long mt = 0, ma = 0, tenths;
+	long mt = 0, ma = 0, ms = 0, tenths;
 	long us, ni, sy, id, io, hi, si, st, tot, idle, dt, di;
 	time_t t;
 	struct tm *tm;
@@ -205,14 +319,18 @@ updatestatus(void)
 	memtxt[0] = '\0';
 	if ((f = fopen("/proc/meminfo", "r"))) {
 		while (fgets(path, sizeof path, f)
-		       && (!mt || !ma)) {
+		       && (!mt || !ma || !ms)) {
 			sscanf(path, "MemTotal: %ld kB", &mt);
 			sscanf(path, "MemAvailable: %ld kB", &ma);
+			sscanf(path, "Shmem: %ld kB", &ms);
 		}
 		fclose(f);
 	}
 	if (mt > 0 && ma > 0 && ma <= mt) {
-		tenths = (mt - ma) * 10 / 1048576; /* tenths of GiB */
+		/* shmem (tmpfs, X/graphics buffers) excluded: show process+kernel use */
+		tenths = (mt - ma - ms) * 10 / 1048576; /* tenths of GiB */
+		if (tenths < 0)
+			tenths = 0;
 		if (tenths > 9999)
 			tenths = 9999;
 		snprintf(memtxt, sizeof memtxt, "%ld.%ldG",
@@ -260,7 +378,12 @@ updatestatus(void)
 static int
 textw(const char *s)
 {
-	return s[0] ? XTextWidth(font, s, (int)strlen(s)) : 0;
+	XGlyphInfo ext;
+
+	if (!s[0])
+		return 0;
+	XftTextExtentsUtf8(dpy, font, (FcChar8 *)s, (int)strlen(s), &ext);
+	return ext.xOff;
 }
 
 /* reserved width of a readout: its template, or the text if it overflows */
@@ -308,25 +431,53 @@ statusw(void)
 	return w;
 }
 
+/* pin the bar to the second monitor when there is one; RandR lists the
+ * primary first. Whole screen without the extension. */
+static void
+updatemon(void)
+{
+	XRRMonitorInfo *info;
+	int i, n;
+
+	mx = 0;
+	my = 0;
+	mw = DisplayWidth(dpy, screen);
+	mh = DisplayHeight(dpy, screen);
+	if (!haverandr)
+		return;
+	if (!(info = XRRGetMonitors(dpy, root, True, &n)))
+		return;
+	if (n > 0) {
+		i = n > 1 ? 1 : 0;
+		mx = info[i].x;
+		my = info[i].y;
+		mw = info[i].width;
+		mh = info[i].height;
+	}
+	XRRFreeMonitors(info);
+}
+
 /* recompute bar geometry and slot every icon; safe to call while hidden */
 static void
 layout(void)
 {
 	int i, x, tw, n = (int)arrlen(icons);
 
+	updatemon();
 	tw = statusw();
-	barw = (int)(2 * hpad) + wsw() + n * (int)(iconsize + spacing) + tw;
+	barw = (int)(2 * hpad) + wsw() + (int)(inputw + spacing)
+	       + n * (int)(iconsize + spacing) + tw;
 	if (n && !tw)
 		barw -= (int)spacing;
 	if (barw < (int)barh)
 		barw = (int)barh;
 	XMoveResizeWindow(dpy, barwin,
-	                  sw - barw - 2 * (int)borderpx - (int)padding,
-	                  atbottom ? sh - (int)barh - 2 * (int)borderpx
-	                             - (int)padding
-	                           : (int)padding,
+	                  mx + mw - barw - 2 * (int)borderpx - (int)padding,
+	                  my + (atbottom ? mh - (int)barh - 2 * (int)borderpx
+	                                   - (int)padding
+	                                 : (int)padding),
 	                  (unsigned int)barw, barh);
-	x = (int)hpad + wsw();
+	x = (int)hpad + wsw() + (int)(inputw + spacing);
 	for (i = 0; i < n; i++) {
 		XMoveResizeWindow(dpy, icons[i], x,
 		                  ((int)barh - (int)iconsize) / 2,
@@ -422,68 +573,250 @@ drawmic(int x, int y, int muted)
 static void
 drawbar(void)
 {
-	int x, w, ty = ((int)barh + font->ascent - font->descent) / 2;
+	const char *s;
+	int x, w, boxy = ((int)barh - (int)iconsize) / 2;
+	int ty = ((int)barh + font->ascent - font->descent) / 2;
 
 	XClearWindow(dpy, barwin);
+	x = (int)hpad;
 	if (desktxt[0]) {
-		x = (int)hpad;
-		XDrawString(dpy, barwin, gc, x, ty, desktxt,
-		            (int)strlen(desktxt));
+		XftDrawStringUtf8(xd, &xftfg, font, x, ty,
+		                  (FcChar8 *)desktxt, (int)strlen(desktxt));
 		x += textw(desktxt) + (int)spacing;
 		XSetForeground(dpy, gc, borderpx_col);
 		XDrawLine(dpy, barwin, gc, x, ((int)barh - (int)divh) / 2,
 		          x, ((int)barh + (int)divh) / 2);
 		XSetForeground(dpy, gc, fgpx);
+		x += 1 + (int)spacing;
 	}
+	/* input box; show the tail of the line when it overflows */
+	XSetForeground(dpy, gc, inputactive ? fgpx : borderpx_col);
+	XDrawRectangle(dpy, barwin, gc, x, boxy, inputw - 1, iconsize - 1);
+	XSetForeground(dpy, gc, fgpx);
+	s = inputbuf;
+	while (*s && textw(s) > (int)inputw - 14)
+		s++;
+	if (*s)
+		XftDrawStringUtf8(xd, &xftfg, font, x + 5, ty,
+		                  (FcChar8 *)s, (int)strlen(s));
+	else if (!inputactive)
+		XftDrawStringUtf8(xd, &xftdim, font, x + 5, ty,
+		                  (FcChar8 *)"$", 1);
+	if (inputactive)
+		XFillRectangle(dpy, barwin, gc, x + 6 + textw(s), boxy + 4,
+		               2, iconsize - 8);
 	x = barw - (int)hpad - statusw();
 	if (cpupct >= 0) {
 		drawcpu(x, ((int)barh - (int)cpuh) / 2);
 		x += (int)(cpuw + icgap);
 		w = slotw(cputxt, cputmpl);
-		XDrawString(dpy, barwin, gc, x + w - textw(cputxt), ty,
-		            cputxt, (int)strlen(cputxt));
+		XftDrawStringUtf8(xd, &xftfg, font, x + w - textw(cputxt),
+		                  ty, (FcChar8 *)cputxt, (int)strlen(cputxt));
 		x += w + (int)spacing;
 	}
 	if (memtxt[0]) {
 		drawmem(x, ((int)barh - (int)memh) / 2);
 		x += (int)(memw + icgap);
 		w = slotw(memtxt, memtmpl);
-		XDrawString(dpy, barwin, gc, x + w - textw(memtxt), ty,
-		            memtxt, (int)strlen(memtxt));
+		XftDrawStringUtf8(xd, &xftfg, font, x + w - textw(memtxt),
+		                  ty, (FcChar8 *)memtxt, (int)strlen(memtxt));
 		x += w + (int)spacing;
 	}
 	if (volpct >= 0) {
 		drawspeaker(x, ((int)barh - (int)spkh) / 2, volmute);
 		x += (int)(spkw + icgap);
 		w = slotw(voltxt, voltmpl);
-		XDrawString(dpy, barwin, gc, x + w - textw(voltxt), ty,
-		            voltxt, (int)strlen(voltxt));
+		XftDrawStringUtf8(xd, &xftfg, font, x + w - textw(voltxt),
+		                  ty, (FcChar8 *)voltxt, (int)strlen(voltxt));
 		x += w + (int)spacing;
 	}
 	if (micpct >= 0) {
 		drawmic(x, ((int)barh - (int)mich) / 2, micmute);
 		x += (int)(micw + icgap);
 		w = slotw(mictxt, mictmpl);
-		XDrawString(dpy, barwin, gc, x + w - textw(mictxt), ty,
-		            mictxt, (int)strlen(mictxt));
+		XftDrawStringUtf8(xd, &xftfg, font, x + w - textw(mictxt),
+		                  ty, (FcChar8 *)mictxt, (int)strlen(mictxt));
 		x += w + (int)spacing;
 	}
 	if (batcap >= 0) {
 		drawbattery(x, ((int)barh - (int)bath) / 2);
 		x += (int)(batw + batnubw + icgap);
-		XDrawString(dpy, barwin, gc, x, ty, battxt,
-		            (int)strlen(battxt));
+		XftDrawStringUtf8(xd, &xftfg, font, x, ty,
+		                  (FcChar8 *)battxt, (int)strlen(battxt));
 		x += textw(battxt) + (int)spacing;
 	}
 	if (clockstr[0])
-		XDrawString(dpy, barwin, gc, x, ty, clockstr,
-		            (int)strlen(clockstr));
+		XftDrawStringUtf8(xd, &xftfg, font, x, ty,
+		                  (FcChar8 *)clockstr, (int)strlen(clockstr));
+}
+
+/* hand the finished command's output to the notification daemon */
+static void
+notifycmd(void)
+{
+	char out[64];
+	char *argv[] = { "notify-send", "-a", "htray", cmdname,
+	                 cmdoutlen ? cmdout : "(no output)", NULL };
+
+	cmdout[cmdoutlen] = '\0';
+	readcmd(argv, out, sizeof out);
+}
+
+static void
+cmdkill(void)
+{
+	if (cmdfd < 0)
+		return;
+	close(cmdfd);
+	cmdfd = -1;
+	kill(cmdpid, SIGKILL); /* no-op if it already exited */
+	while (waitpid(cmdpid, NULL, 0) < 0 && errno == EINTR)
+		;
+	cmdpid = 0;
+}
+
+/* run the typed line via sh -c; output is read back in run()'s select
+ * loop, so a slow command never blocks the bar */
+static void
+runinput(void)
+{
+	int fd[2];
+
+	cmdkill();
+	cmdoutlen = 0;
+	if (!inputbuf[0] || pipe(fd) < 0)
+		return;
+	strcpy(cmdname, inputbuf);
+	switch ((cmdpid = fork())) {
+	case -1:
+		close(fd[0]);
+		close(fd[1]);
+		cmdpid = 0;
+		return;
+	case 0:
+		close(fd[0]);
+		dup2(fd[1], 1);
+		dup2(fd[1], 2);
+		close(fd[1]);
+		execl("/bin/sh", "sh", "-c", inputbuf, (char *)NULL);
+		_exit(127);
+	}
+	close(fd[1]);
+	cmdfd = fd[0];
+}
+
+/* drain command output; once it finishes, notify with what it printed */
+static void
+cmdread(void)
+{
+	char buf[256];
+	ssize_t n;
+	size_t i;
+
+	n = read(cmdfd, buf, sizeof buf);
+	if (n < 0 && errno == EINTR)
+		return;
+	if (n > 0) {
+		for (i = 0; i < (size_t)n && cmdoutlen < sizeof cmdout - 1;
+		     i++)
+			cmdout[cmdoutlen++] = buf[i];
+	} else {
+		cmdkill();
+		notifycmd();
+	}
+}
+
+static void
+startinput(void)
+{
+	struct timespec ts = { 0, 10 * 1000000L };
+	int i;
+
+	if (inputactive)
+		return;
+	/* the WM's passive grab on the keybinding that signalled us stays
+	 * active until its keys are released; retry like dmenu does */
+	for (i = 0; i < 100; i++) {
+		if (XGrabKeyboard(dpy, barwin, True, GrabModeAsync,
+		                  GrabModeAsync, CurrentTime) == GrabSuccess) {
+			inputactive = 1;
+			drawbar();
+			return;
+		}
+		nanosleep(&ts, NULL);
+	}
+}
+
+static void
+stopinput(void)
+{
+	if (!inputactive)
+		return;
+	inputactive = 0;
+	XUngrabKeyboard(dpy, CurrentTime);
+}
+
+static void
+keypress(XKeyEvent *kev)
+{
+	char c[8];
+	KeySym ks = NoSymbol;
+	size_t len = strlen(inputbuf);
+	int n = XLookupString(kev, c, sizeof c, &ks, NULL);
+
+	switch (ks) {
+	case XK_Return:
+	case XK_KP_Enter:
+		stopinput();
+		runinput();
+		inputbuf[0] = '\0';
+		drawbar();
+		break;
+	case XK_Escape:
+		inputbuf[0] = '\0';
+		stopinput();
+		drawbar();
+		break;
+	case XK_BackSpace:
+		if (len)
+			inputbuf[len - 1] = '\0';
+		drawbar();
+		break;
+	default:
+		if (n != 1)
+			break;
+		if (c[0] == 0x15) /* ^U clears the line */
+			inputbuf[0] = '\0';
+		else if ((unsigned char)c[0] >= 0x20 && c[0] != 0x7f
+		         && len < sizeof inputbuf - 1) {
+			inputbuf[len] = c[0];
+			inputbuf[len + 1] = '\0';
+		} else
+			break;
+		drawbar();
+	}
+}
+
+/* left click on the box focuses it; any other click unfocuses */
+static void
+buttonpress(XButtonEvent *bev)
+{
+	int bx = (int)hpad + wsw();
+
+	if (bev->button == Button1 && bev->x >= bx
+	    && bev->x < bx + (int)inputw) {
+		startinput();
+	} else if (inputactive) {
+		stopinput();
+		drawbar();
+	}
 }
 
 static void
 toggle(void)
 {
 	if (visible) {
+		stopinput();
 		XUnmapWindow(dpy, barwin);
 		visible = 0;
 	} else {
@@ -558,6 +891,14 @@ handle(XEvent *ev)
 		if (ev->xexpose.window == barwin && ev->xexpose.count == 0)
 			drawbar();
 		break;
+	case KeyPress:
+		if (inputactive)
+			keypress(&ev->xkey);
+		break;
+	case ButtonPress:
+		if (ev->xbutton.window == barwin)
+			buttonpress(&ev->xbutton);
+		break;
 	case DestroyNotify:
 		undock(ev->xdestroywindow.window);
 		break;
@@ -571,6 +912,15 @@ handle(XEvent *ev)
 		    && (ev->xconfigure.width != (int)iconsize
 		        || ev->xconfigure.height != (int)iconsize))
 			layout();
+		/* keep the bar on top when other windows restack above it */
+		else if (visible && ev->xconfigure.event == root
+		         && ev->xconfigure.window != barwin)
+			XRaiseWindow(dpy, barwin);
+		break;
+	case MapNotify:
+		if (visible && ev->xmap.event == root
+		    && ev->xmap.window != barwin)
+			XRaiseWindow(dpy, barwin);
 		break;
 	case PropertyNotify:
 		if (ev->xproperty.window == root
@@ -605,22 +955,30 @@ setup(void)
 	XSetWindowAttributes swa;
 	struct sigaction sa;
 	XEvent ev;
-	char selname[32];
+	char selname[32], fontpat[128];
 	long orient = 0; /* horizontal */
 
+	int di;
+
+	loadconfig();
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("htray: cannot open display\n");
 	XSetErrorHandler(xerror);
 	screen = DefaultScreen(dpy);
 	root = RootWindow(dpy, screen);
-	sw = DisplayWidth(dpy, screen);
-	sh = DisplayHeight(dpy, screen);
+	haverandr = XRRQueryExtension(dpy, &di, &di);
 	bgpx = getcolor(col_bg);
 	fgpx = getcolor(col_fg);
 	borderpx_col = getcolor(col_border);
 
-	if (!(font = XLoadQueryFont(dpy, fontname))
-	    && !(font = XLoadQueryFont(dpy, "fixed")))
+	/* fontconfig name; a set fontsize overrides the pattern's size */
+	if (fontsize)
+		snprintf(fontpat, sizeof fontpat, "%s:pixelsize=%u",
+		         fontname, fontsize);
+	else
+		snprintf(fontpat, sizeof fontpat, "%s", fontname);
+	if (!(font = XftFontOpenName(dpy, screen, fontpat))
+	    && !(font = XftFontOpenName(dpy, screen, "monospace")))
 		die("htray: cannot load font\n");
 
 	xembed = XInternAtom(dpy, "_XEMBED", False);
@@ -644,14 +1002,22 @@ setup(void)
 	swa.override_redirect = True;
 	swa.background_pixel = bgpx;
 	swa.border_pixel = borderpx_col;
-	swa.event_mask = ExposureMask|SubstructureNotifyMask;
+	swa.event_mask = ExposureMask|SubstructureNotifyMask|ButtonPressMask
+	                 |KeyPressMask;
 	barwin = XCreateWindow(dpy, root, 0, 0, barh, barh, borderpx,
 	                       CopyFromParent, CopyFromParent, CopyFromParent,
 	                       CWOverrideRedirect|CWBackPixel|CWBorderPixel
 	                       |CWEventMask, &swa);
 	gc = XCreateGC(dpy, barwin, 0, NULL);
-	XSetFont(dpy, gc, font->fid);
 	XSetForeground(dpy, gc, fgpx);
+	xd = XftDrawCreate(dpy, barwin, DefaultVisual(dpy, screen),
+	                   DefaultColormap(dpy, screen));
+	if (!XftColorAllocName(dpy, DefaultVisual(dpy, screen),
+	                       DefaultColormap(dpy, screen), col_fg, &xftfg)
+	    || !XftColorAllocName(dpy, DefaultVisual(dpy, screen),
+	                          DefaultColormap(dpy, screen), col_border,
+	                          &xftdim))
+		die("htray: cannot allocate colors\n");
 
 	/* tell waiting applets a tray is now available */
 	memset(&ev, 0, sizeof ev);
@@ -663,7 +1029,7 @@ setup(void)
 	ev.xclient.data.l[1] = (long)trayatom;
 	ev.xclient.data.l[2] = (long)selwin;
 	XSendEvent(dpy, root, False, StructureNotifyMask, &ev);
-	XSelectInput(dpy, root, PropertyChangeMask);
+	XSelectInput(dpy, root, PropertyChangeMask|SubstructureNotifyMask);
 
 	findbattery();
 	updatedesktop();
@@ -675,9 +1041,10 @@ setup(void)
 	}
 
 	memset(&sa, 0, sizeof sa);
-	sa.sa_handler = sigusr1;
+	sa.sa_handler = sighandler;
 	sigemptyset(&sa.sa_mask); /* no SA_RESTART: select must wake up */
 	sigaction(SIGUSR1, &sa, NULL);
+	sigaction(SIGUSR2, &sa, NULL);
 	XSync(dpy, False);
 }
 
@@ -687,7 +1054,7 @@ run(void)
 	XEvent ev;
 	fd_set fds;
 	struct timeval tv;
-	int xfd = ConnectionNumber(dpy);
+	int nfds, nready, xfd = ConnectionNumber(dpy);
 
 	for (;;) {
 		while (XPending(dpy)) {
@@ -700,18 +1067,42 @@ run(void)
 			XSync(dpy, False);
 			continue;
 		}
+		if (focusreq) {
+			focusreq = 0;
+			if (inputactive) {
+				stopinput();
+				drawbar();
+			} else {
+				if (!visible)
+					toggle();
+				XSync(dpy, False);
+				startinput();
+			}
+			XSync(dpy, False);
+			continue;
+		}
 		FD_ZERO(&fds);
 		FD_SET(xfd, &fds);
+		nfds = xfd;
+		if (cmdfd >= 0) {
+			FD_SET(cmdfd, &fds);
+			if (cmdfd > nfds)
+				nfds = cmdfd;
+		}
 		/* visible: poll every second so volume changes show up fast;
 		 * hidden: wake just past the next minute boundary */
 		tv.tv_sec = visible ? 1 : 60 - (long)(time(NULL) % 60);
 		tv.tv_usec = 0;
-		if (select(xfd + 1, &fds, NULL, NULL, &tv) < 0) {
+		if ((nready = select(nfds + 1, &fds, NULL, NULL, &tv)) < 0) {
 			if (errno == EINTR)
 				continue;
 			die("htray: select failed\n");
 		}
-		if (!FD_ISSET(xfd, &fds) && updatestatus() && visible) {
+		if (cmdfd >= 0 && FD_ISSET(cmdfd, &fds)) {
+			cmdread();
+			XSync(dpy, False);
+		}
+		if (nready == 0 && updatestatus() && visible) {
 			layout();
 			drawbar();
 			XSync(dpy, False);
