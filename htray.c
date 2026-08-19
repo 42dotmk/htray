@@ -24,6 +24,10 @@
 #include <X11/extensions/Xrandr.h>
 #include <X11/Xft/Xft.h>
 
+#ifndef HTRAY_VERSION
+#define HTRAY_VERSION "dev"
+#endif
+
 #define STB_DS_IMPLEMENTATION
 #include <stb_ds.h>
 
@@ -1111,8 +1115,14 @@ run(void)
 }
 
 int
-main(void)
+main(int argc, char *argv[])
 {
+	if (argc == 2 && !strcmp(argv[1], "-v")) {
+		printf("htray %s\n", HTRAY_VERSION);
+		return 0;
+	}
+	if (argc > 1)
+		die("usage: htray [-v]\n");
 	setup();
 	run();
 	return 0;
