@@ -14,7 +14,7 @@ make install    # symlinks it into ~/.local/bin
 make clean
 ```
 
-There are no tests or lint targets; the compiler flags (`-std=c99 -pedantic -Wall -Wextra`) are the lint. Keep the build warning-free.
+There are no tests or lint targets; the compiler flags (`-std=c11 -pedantic -Wall -Wextra`) are the lint. Keep the build warning-free.
 
 `vendor/stb_ds.h` is the only dependency beyond Xlib/Xrandr; it provides the dynamic array (`arrput`/`arrdel`/`arrlen`) used for the docked-icon list.
 
@@ -36,4 +36,4 @@ Tray icons come and go asynchronously; the X error handler deliberately ignores 
 
 ## Style
 
-Follows suckless/OpenBSD C style: C99, tabs, return type on its own line, no dynamic allocation beyond stb_ds, fixed-size buffers with `snprintf`. Match it.
+Follows suckless/OpenBSD C style: C11, tabs, return type on its own line, no dynamic allocation beyond stb_ds, fixed-size buffers with `snprintf`. Match it.
