@@ -36,4 +36,4 @@ Tray icons come and go asynchronously; the X error handler deliberately ignores 
 
 ## Style
 
-Follows suckless/OpenBSD C style: C11, tabs, return type on its own line, no dynamic allocation beyond stb_ds, fixed-size buffers with `snprintf`. Match it.
+Suckless/OpenBSD C conventions — C11, no dynamic allocation beyond stb_ds, fixed-size buffers with `snprintf` — formatted by clang-format via the repo's `.clang-format` (shared across the siblings: 4-space indent, attached braces, 80 columns). Run `clang-format -i` on files you touch.
