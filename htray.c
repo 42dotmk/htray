@@ -1,11 +1,3 @@
-/* htray - a toggleable overlay bar with a system tray and status readout
- * (battery, speaker/mic volume with mute state, clock).
- *
- * Owns the _NET_SYSTEM_TRAY_S<n> selection so applets (nm-applet, blueman,
- * ...) dock their icons here via XEmbed. The bar is an override-redirect
- * window in a screen corner (see atbottom); SIGUSR1 toggles it
- * (bind `pkill -USR1 -x htray` in your window manager). The applets keep
- * running while hidden - only the bar window is unmapped. */
 #include <X11/Xatom.h>
 #include <X11/Xft/Xft.h>
 #include <X11/Xlib.h>
