@@ -111,6 +111,7 @@ static void loadconfig(void) {
     envstr("HTRAY_BORDER", &col_border);
     envstr("HTRAY_FONT", &fontname);
     envstr("HTRAY_TIMEFMT", &timefmt);
+    envstr("HTRAY_INPUTCMD", &inputcmd);
     if (barh < 8)
         barh = 8;
 }
@@ -621,9 +622,11 @@ static void cmdkill(void) {
     cmdpid = 0;
 }
 
-/* run the typed line via sh -c; output is read back in run()'s select
- * loop, so a slow command never blocks the bar */
+/* run the typed line via sh -c, or hand it to inputcmd as a single
+ * argument; output is read back in run()'s select loop, so a slow
+ * command never blocks the bar */
 static void runinput(void) {
+    char cmd[512];
     int fd[2];
 
     cmdkill();
@@ -642,7 +645,12 @@ static void runinput(void) {
         dup2(fd[1], 1);
         dup2(fd[1], 2);
         close(fd[1]);
-        execl("/bin/sh", "sh", "-c", inputbuf, (char *)NULL);
+        if (*inputcmd) {
+            snprintf(cmd, sizeof cmd, "%s \"$1\"", inputcmd);
+            execl("/bin/sh", "sh", "-c", cmd, "sh", inputbuf, (char *)NULL);
+        } else {
+            execl("/bin/sh", "sh", "-c", inputbuf, (char *)NULL);
+        }
         _exit(127);
     }
     close(fd[1]);

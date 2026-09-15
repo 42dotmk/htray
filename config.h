@@ -17,6 +17,7 @@ static unsigned int fontsize = 16; /* px size appended to the pattern; 0 = patte
 static const char *timefmt = "%d(%a) %H:%M"; /* strftime clock format, HTRAY_TIMEFMT */
 static unsigned int cmdtimeout =     500; /* ms before readcmd kills, HTRAY_CMDTIMEOUT */
 static unsigned int inputw = 180; /* command input box width, HTRAY_INPUTW */
+static const char *inputcmd = "hai say"; /* command the typed line is passed to as one quoted argument (e.g. "hai say"); empty runs the line itself via sh -c, HTRAY_INPUTCMD */
 static int starthidden = 0; /* start with the bar unmapped, HTRAY_HIDDEN */
 static int atbottom = 1;    /* anchor to bottom edge, HTRAY_BOTTOM */
 
